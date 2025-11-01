@@ -1,43 +1,54 @@
-import os, openai, random
-from moviepy.editor import *
+from moviepy.editor import VideoFileClip, CompositeVideoClip, vfx, AudioFileClip
 from pydub import AudioSegment
-import subprocess
+import os, random, numpy as np
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+raw_folder = "raw_clips"
+sound_folder = "soundVFX"
+output_folder = "output_clips"
 
-RAW_PATH = "raw_clips"
-OUT_PATH = "output_clips"
+# Load all raw clips
+clips = [os.path.join(raw_folder, f) for f in os.listdir(raw_folder) if f.endswith(".mp4")]
 
-def transcribe_audio(video_path):
-    audio_path = "temp_audio.mp3"
-    subprocess.call(['ffmpeg', '-i', video_path, '-vn', '-acodec', 'mp3', audio_path, '-y'])
-    with open(audio_path, "rb") as f:
-        transcript = openai.Audio.transcriptions.create(model="whisper-1", file=f)
-    return transcript.text
+for i, path in enumerate(clips):
+    clip = VideoFileClip(path)
 
-def generate_overlay_text(transcript):
-    prompt = f"Write a catchy short caption for a viral English IRL clip. Text should match the moment tone and be engaging:\n\n{transcript}"
-    res = openai.Chat.completions.create(model="gpt-4-turbo", messages=[{"role": "user", "content": prompt}])
-    return res.choices[0].message.content.strip()
+    # Convert horizontal → vertical
+    bg = clip.resize(height=1920).fx(vfx.blur, 50)
+    fg = clip.resize(height=1080).set_position('center')
+    video = CompositeVideoClip([bg, fg])
 
-def edit_clip(video_path):
-    print(f"Processing: {video_path}")
-    transcript = transcribe_audio(video_path)
-    overlay_text = generate_overlay_text(transcript)
+    # 🔊 Analyze sound for peaks (moments)
+    audio_path = "temp_audio.wav"
+    clip.audio.write_audiofile(audio_path, verbose=False, logger=None)
+    audio = AudioSegment.from_wav(audio_path)
+    samples = np.array(audio.get_array_of_samples())
+    samples = samples.astype(np.float32)
+    samples = np.abs(samples)
+    threshold = np.percentile(samples, 97)  # top 3% loudest
+    peaks = np.where(samples > threshold)[0]
 
-    clip = VideoFileClip(video_path).subclip(0, min(clip.duration, 25))
-    blurred_bg = clip.resize(height=1080).fx(vfx.blur, 10)
-    main = clip.resize(height=1080).margin(10)
-    final = CompositeVideoClip([
-        blurred_bg,
-        main.set_position("center"),
-        TextClip(overlay_text, fontsize=70, color='white', font='Arial-Bold', size=(1080, None), method='caption')
-        .set_position(("center", 50)).set_duration(clip.duration)
-    ])
-    out_file = os.path.join(OUT_PATH, os.path.basename(video_path))
-    final.write_videofile(out_file, codec="libx264", audio_codec="aac")
-    print(f"Saved → {out_file}")
+    # If peaks exist → add whoosh & mini zoom
+    if len(peaks) > 0:
+        peak_time = (peaks[0] / audio.frame_rate)
+        end_time = min(peak_time + 0.5, clip.duration)
+        focus = video.subclip(peak_time, end_time).fx(vfx.zoom_in, 1.1)
+        video = CompositeVideoClip([video.set_start(0), focus.set_start(peak_time)])
 
-for file in os.listdir(RAW_PATH):
-    if file.endswith((".mp4", ".mov")):
-        edit_clip(os.path.join(RAW_PATH, file))
+        # Add whoosh sound
+        sfx_list = [os.path.join(sound_folder, f) for f in os.listdir(sound_folder) if f.endswith(".mp3")]
+        if sfx_list:
+            sfx = AudioFileClip(random.choice(sfx_list)).volumex(0.5)
+            sfx = sfx.set_start(peak_time)
+            video = CompositeVideoClip([video, sfx.set_duration(0.5)])
+
+    # Add smooth fade at start and end
+    video = video.fadein(0.4).fadeout(0.4)
+
+    # Export
+    output_path = os.path.join(output_folder, f"moment_clip_{i+1}.mp4")
+    video.write_videofile(output_path, fps=30)
+
+    # Cleanup
+    os.remove(audio_path)
+
+print("✅ All moment clips processed and effects added!")
